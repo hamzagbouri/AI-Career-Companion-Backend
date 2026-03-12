@@ -5,10 +5,14 @@ from app.database import engine, Base
 from app.routers import auth, admin
 from app.utils.create_admin import create_default_admin
 from app.database import SessionLocal
+from app.routers import cv
+from fastapi.staticfiles import StaticFiles
+
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="AI Career Companion API")
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 # CORS configuration
 origins = [
@@ -26,6 +30,7 @@ app.add_middleware(
 
 app.include_router(auth.router)
 app.include_router(admin.router)
+app.include_router(cv.router)
 
 
 @app.on_event("startup")
