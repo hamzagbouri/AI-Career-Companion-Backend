@@ -12,6 +12,15 @@ services:
     environment:
       DATABASE_URL: postgresql://postgres:password@postgres:5432/aicareer
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ai_career_ollama
+    restart: always
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+
   postgres:
     image: postgres:15
     container_name: ai_career_db
@@ -39,3 +48,4 @@ services:
 
 volumes:
   postgres_data:
+  ollama_data:

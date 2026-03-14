@@ -7,6 +7,7 @@ from app.database import get_db
 from app.dependencies import get_current_user
 from app.models.cv import CV
 from app.services.cv_service import extract_text_from_pdf
+from app.services.llm_service import audit_cv_with_llm, LLMUnavailableError
 import uuid
 
 router = APIRouter(prefix="/cv", tags=["CV"])
@@ -85,6 +86,30 @@ def get_cv(
         raise HTTPException(status_code=403, detail="Access denied")
 
     return cv
+
+
+@router.post("/{cv_id}/audit")
+async def audit_cv(
+    cv_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    cv = db.query(CV).filter(CV.id == cv_id).first()
+
+    if not cv:
+        raise HTTPException(status_code=404, detail="CV not found")
+
+    if user.role == "student" and cv.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    try:
+        result = await audit_cv_with_llm(cv.extracted_text or "")
+        return result
+    except LLMUnavailableError as e:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM service temporarily unavailable. Ensure Ollama is running and the model is pulled (e.g. ollama pull llama3.1).",
+        ) from e
 
 @router.put("/{cv_id}")
 def update_cv(
