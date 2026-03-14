@@ -1,6 +1,6 @@
 import os
 
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -50,25 +50,29 @@ async def upload_cv(
 
 @router.get("/my")
 def get_my_cvs(
+    search: str | None = Query(None),
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
-
-    cvs = db.query(CV).filter(CV.user_id == user.id).all()
-
+    q = db.query(CV).filter(CV.user_id == user.id)
+    if search:
+        q = q.filter(CV.filename.ilike(f"%{search.strip()}%"))
+    cvs = q.order_by(CV.created_at.desc()).all()
     return cvs
+
 
 @router.get("/")
 def get_all_cvs(
+    search: str | None = Query(None),
     db: Session = Depends(get_db),
     user=Depends(get_current_user)
 ):
-
     if user.role not in ["mentor", "admin"]:
         raise HTTPException(status_code=403, detail="Access denied")
-
-    cvs = db.query(CV).all()
-
+    q = db.query(CV)
+    if search:
+        q = q.filter(CV.filename.ilike(f"%{search.strip()}%"))
+    cvs = q.order_by(CV.created_at.desc()).all()
     return cvs  
 
 @router.get("/{cv_id}")

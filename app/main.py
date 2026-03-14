@@ -5,7 +5,7 @@ from app.database import engine, Base
 from app.routers import auth, admin
 from app.utils.create_admin import create_default_admin
 from app.database import SessionLocal
-from app.routers import cv
+from app.routers import cv, exercises, certificates
 from fastapi.staticfiles import StaticFiles
 
 
@@ -33,6 +33,8 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(cv.router)
+app.include_router(exercises.router)
+app.include_router(certificates.router)
 
 
 @app.on_event("startup")
