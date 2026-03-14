@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.dependencies import get_current_user
-from app.models.cv import CV
+from app.models.cv import CV, CVAuditRecord
+from app.schemas.cv import CVAuditRecordResponse
 from app.services.cv_service import extract_text_from_pdf
 from app.services.llm_service import audit_cv_with_llm, LLMUnavailableError
 import uuid
@@ -104,12 +105,39 @@ async def audit_cv(
 
     try:
         result = await audit_cv_with_llm(cv.extracted_text or "")
-        return result
     except LLMUnavailableError as e:
         raise HTTPException(
             status_code=503,
             detail="LLM service temporarily unavailable. Ensure Ollama is running and the model is pulled (e.g. ollama pull llama3.1).",
         ) from e
+
+    record = CVAuditRecord(
+        cv_id=cv_id,
+        summary=result["summary"],
+        strengths=result["strengths"],
+        weaknesses=result["weaknesses"],
+        recommendations=result["recommendations"],
+        score=result["score"],
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@router.get("/{cv_id}/audits", response_model=list[CVAuditRecordResponse])
+def get_cv_audits(
+    cv_id: int,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user)
+):
+    cv = db.query(CV).filter(CV.id == cv_id).first()
+    if not cv:
+        raise HTTPException(status_code=404, detail="CV not found")
+    if user.role == "student" and cv.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    records = db.query(CVAuditRecord).filter(CVAuditRecord.cv_id == cv_id).order_by(CVAuditRecord.created_at.desc()).all()
+    return records
 
 @router.put("/{cv_id}")
 def update_cv(
