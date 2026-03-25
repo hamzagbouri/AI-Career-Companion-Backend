@@ -3,6 +3,20 @@ from sqlalchemy.sql import func
 from app.database import Base
 
 
+class ExerciseSet(Base):
+    """A named practice pack (several exercises) generated together for a student."""
+
+    __tablename__ = "exercise_sets"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    title = Column(String(256), nullable=False)
+    language = Column(String(32), nullable=False)
+    topic = Column(String(128), nullable=True)
+    difficulty = Column(String(32), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
 class Exercise(Base):
     """LLM-generated coding exercise, tied to a user, language, and topic."""
 
@@ -10,6 +24,8 @@ class Exercise(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    set_id = Column(Integer, ForeignKey("exercise_sets.id", ondelete="CASCADE"), nullable=True)
+    order_in_set = Column(Integer, nullable=True)
     language = Column(String(32), nullable=False)
     topic = Column(String(128), nullable=True)  # e.g. OOP, dictionaries, tuples
     title = Column(String(256), nullable=False)
