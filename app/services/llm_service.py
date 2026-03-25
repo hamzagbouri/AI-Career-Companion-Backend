@@ -12,7 +12,40 @@ logger = logging.getLogger(__name__)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or ""
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+_GEMINI_MODEL_FALLBACKS_RAW = os.getenv("GEMINI_MODEL_FALLBACKS", "")
+
+
+def _get_gemini_model_candidates() -> list[str]:
+    """
+    Ordered Gemini model candidates for failover.
+
+    Primary model is GEMINI_MODEL. Fallbacks come from GEMINI_MODEL_FALLBACKS (comma-separated),
+    otherwise we use a conservative default set of text-output models.
+    """
+    primary = (GEMINI_MODEL or "").strip()
+    fallbacks = [m.strip() for m in (_GEMINI_MODEL_FALLBACKS_RAW or "").split(",") if m.strip()]
+    if not fallbacks:
+        fallbacks = [
+            "gemini-3-flash-preview",
+            "gemini-2.5-flash",
+            "gemini-2.5-pro",
+            "gemini-2-flash",
+            "gemini-2-flash-exp",
+            "gemini-2-flash-lite",
+            "gemini-2.5-flash-lite",
+            "gemini-3.1-pro",
+            "gemini-3.1-flash-lite",
+        ]
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for m in [primary, *fallbacks]:
+        if not m or m in seen:
+            continue
+        seen.add(m)
+        ordered.append(m)
+    return ordered
 
 
 class CVAuditResult(TypedDict):
@@ -81,11 +114,6 @@ async def generate_exercise_with_gemini(language: str, difficulty: str = "Beginn
         "additionalProperties": False,
     }
 
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent"
-    )
-
     payload = {
         "contents": [
             {
@@ -106,45 +134,60 @@ async def generate_exercise_with_gemini(language: str, difficulty: str = "Beginn
         "x-goog-api-key": GEMINI_API_KEY,
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=120.0)) as client:
-            resp = await client.post(url, json=payload, headers=headers)
+    gemini_models = _get_gemini_model_candidates()
+    last_error: str = "Unknown Gemini error"
 
-        if resp.status_code >= 400:
-            raise LLMUnavailableError(
-                f"Gemini returned {resp.status_code}: {resp.text[:500]}"
-            )
-
-        data = resp.json()
-
-        text = _extract_text_from_gemini_response(data)
-
-        if not text:
-            candidate = ((data.get("candidates") or [{}])[0] if isinstance(data, dict) else {})
-            finish_reason = candidate.get("finishReason")
-            safety_ratings = candidate.get("safetyRatings")
-            logger.error("Gemini empty text response: %s", json.dumps(data, ensure_ascii=False)[:3000])
-            raise LLMUnavailableError(
-                f"Gemini returned no text. finishReason={finish_reason}, safetyRatings={safety_ratings}"
-            )
-
+    for model in gemini_models:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent"
+        )
         try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            logger.error("Gemini invalid JSON text: %r", text[:3000])
-            raise LLMUnavailableError(f"Gemini returned non-JSON text: {text[:300]!r}")
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=120.0)) as client:
+                resp = await client.post(url, json=payload, headers=headers)
 
-        return parsed
+            if resp.status_code >= 400:
+                last_error = f"Gemini model={model} returned {resp.status_code}: {resp.text[:500]}"
+                logger.warning(last_error)
+                continue
 
-    except httpx.TimeoutException as e:
-        logger.exception("Gemini timeout")
-        raise LLMUnavailableError(f"Gemini timeout: {e}") from e
-    except httpx.HTTPError as e:
-        logger.exception("Gemini HTTP error")
-        raise LLMUnavailableError(f"Gemini HTTP error: {e}") from e
-    except Exception as e:
-        logger.exception("Gemini generation failed")
-        raise LLMUnavailableError(f"Gemini generation failed: {e}") from e
+            data = resp.json()
+
+            text = _extract_text_from_gemini_response(data)
+            if not text:
+                candidate = ((data.get("candidates") or [{}])[0] if isinstance(data, dict) else {})
+                finish_reason = candidate.get("finishReason")
+                safety_ratings = candidate.get("safetyRatings")
+                last_error = (
+                    f"Gemini model={model} returned empty text. "
+                    f"finishReason={finish_reason}, safetyRatings={safety_ratings}"
+                )
+                logger.warning(last_error)
+                continue
+
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                last_error = f"Gemini model={model} returned non-JSON text: {text[:300]!r}"
+                logger.warning(last_error)
+                continue
+
+            return parsed
+
+        except httpx.TimeoutException as e:
+            last_error = f"Gemini model={model} timeout: {e}"
+            logger.warning(last_error)
+            continue
+        except httpx.HTTPError as e:
+            last_error = f"Gemini model={model} HTTP error: {e}"
+            logger.warning(last_error)
+            continue
+        except Exception as e:
+            last_error = f"Gemini model={model} failure: {e}"
+            logger.warning(last_error)
+            continue
+
+    raise LLMUnavailableError(f"Gemini generation failed for all models. Last error: {last_error}")
 
 
 async def audit_cv_with_llm(extracted_text: str) -> CVAuditResult:
@@ -700,6 +743,110 @@ class EvaluateResult(TypedDict):
     correct: bool
     feedback: str
     correct_answer: str
+
+
+async def evaluate_submission_with_gemini(
+    language: str,
+    description: str,
+    expected_solution: str,
+    submitted_code: str,
+) -> EvaluateResult:
+    """
+    Gemini-based submission evaluator.
+
+    It only asks Gemini for {correct:boolean, feedback:string} to keep output small and avoid
+    invalid/truncated JSON. The router uses expected_solution as the "correct answer" to show.
+    """
+    if not GEMINI_API_KEY:
+        raise LLMUnavailableError("GEMINI_API_KEY is not set")
+
+    # Keep the payload small to avoid Gemini truncating JSON.
+    desc = (description or "").strip()[:2000]
+    ref = (expected_solution or "").strip()[:2500]
+    stu = (submitted_code or "").strip()[:5000]
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "correct": {"type": "boolean"},
+            "feedback": {"type": "string"},
+        },
+        "required": ["correct", "feedback"],
+        "additionalProperties": False,
+    }
+
+    prompt = (
+        "You are a programming teacher and code reviewer.\n"
+        f"Language: {language}\n\n"
+        f"Problem description:\n{desc}\n\n"
+        f"Reference solution:\n{ref}\n\n"
+        f"Student submission:\n{stu}\n\n"
+        "Return ONLY a valid JSON object that matches the schema.\n"
+        "Rules:\n"
+        "- correct=true only if the student submission matches the reference solution.\n"
+        "- feedback must be short (max 200 characters).\n"
+        "- No markdown. No extra text."
+    )
+
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "maxOutputTokens": 400,
+            "responseMimeType": "application/json",
+            "responseJsonSchema": schema,
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    gemini_models = _get_gemini_model_candidates()
+    last_error: str = "Unknown Gemini error"
+
+    for model in gemini_models:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=60.0)) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+
+            if resp.status_code >= 400:
+                last_error = f"Gemini model={model} returned {resp.status_code}: {resp.text[:400]}"
+                logger.warning(last_error)
+                continue
+
+            data = resp.json()
+            text = _extract_text_from_gemini_response(data)
+            if not text:
+                last_error = f"Gemini model={model} returned empty content"
+                logger.warning(last_error)
+                continue
+
+            parsed = json.loads(text)
+            correct = bool(parsed.get("correct", False))
+            feedback = str(parsed.get("feedback", "")).strip() or "No feedback."
+
+            return {
+                "correct": correct,
+                "feedback": feedback,
+                # Router expects a full correct answer when not correct.
+                "correct_answer": "" if correct else expected_solution,
+            }
+        except (json.JSONDecodeError, TypeError, ValueError) as e:
+            last_error = f"Gemini model={model} invalid JSON: {e}"
+            logger.warning(last_error)
+            continue
+        except httpx.HTTPError as e:
+            last_error = f"Gemini model={model} request failed: {e}"
+            logger.warning(last_error)
+            continue
+        except Exception as e:
+            last_error = f"Gemini model={model} failure: {e}"
+            logger.warning(last_error)
+            continue
+
+    raise LLMUnavailableError(f"Gemini evaluation failed for all models. Last error: {last_error}")
 
 
 async def evaluate_submission_with_llm(
