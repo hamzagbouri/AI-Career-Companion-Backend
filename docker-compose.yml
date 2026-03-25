@@ -11,6 +11,18 @@ services:
       - .:/app
     environment:
       DATABASE_URL: postgresql://postgres:password@postgres:5432/aicareer
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: llama3:8b
+      # Optional: when set, exercises are generated with Gemini instead of Ollama.
+      # Add it via your shell/env, not hardcoded in the repo.
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3-flash-preview}
+    # DNS fix for intermittent "Name or service not known" / connect failures
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    networks:
+      - ai_career_net
 
   ollama:
     image: ollama/ollama:latest
@@ -20,6 +32,8 @@ services:
       - "11434:11434"
     volumes:
       - ollama_data:/root/.ollama
+    networks:
+      - ai_career_net
 
   postgres:
     image: postgres:15
@@ -33,6 +47,8 @@ services:
       - "5433:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - ai_career_net
 
   pgadmin:
     image: dpage/pgadmin4
@@ -45,7 +61,12 @@ services:
       - "5050:80"
     depends_on:
       - postgres
+    networks:
+      - ai_career_net
 
 volumes:
   postgres_data:
   ollama_data:
+
+networks:
+  ai_career_net:
