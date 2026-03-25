@@ -1,1 +1,9 @@
 uploads/
+app/__pycache__/
+app/models/__pycache__/
+app/schemas/__pycache__/
+app/services/__pycache__/
+app/utils/__pycache__/
+app/dependencies/__pycache__/
+app/database/__pycache__/
+app/routers/__pycache__/
