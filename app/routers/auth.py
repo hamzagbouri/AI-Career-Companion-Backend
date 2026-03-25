@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.dependencies import get_current_user
 from app.models.user import User
 from app.schemas.user import StudentRegister, MentorRegister, LoginSchema
 from app.utils.security import hash_password, verify_password, create_access_token
@@ -77,3 +78,9 @@ def login(data: LoginSchema, db: Session = Depends(get_db)):
     token = create_access_token({"user_id": user.id, "role": user.role})
 
     return {"access_token": token, "token_type": "bearer"}
+
+
+@router.post("/logout")
+def logout(_: User = Depends(get_current_user)):
+    """Logout: invalidate session. Client must clear the token."""
+    return {"message": "Logged out"}
