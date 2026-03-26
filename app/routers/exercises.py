@@ -196,14 +196,27 @@ async def preview_generate_exercises(
     batch_id = str(uuid4())
     draft_exercises: list[PreviewExerciseDraft] = []
     stored: list[dict] = []
+    existing_titles: set[str] = set()
 
     for _i in range(desired):
         try:
-            result = await generate_exercise_with_llm(
-                language=body.language,
-                difficulty=body.difficulty,
-                topic=body.topic,
-            )
+            result = None
+            # Retry a couple times inside the same batch to reduce duplicates.
+            for _retry in range(3):
+                variant_nonce = str(uuid4())
+                candidate = await generate_exercise_with_llm(
+                    language=body.language,
+                    difficulty=body.difficulty,
+                    topic=body.topic,
+                    variant_nonce=variant_nonce,
+                    avoid_titles=list(existing_titles),
+                )
+                if candidate and candidate.get("title") not in existing_titles:
+                    result = candidate
+                    break
+            if result is None:
+                # Last fallback: accept whatever we got.
+                result = candidate
         except LLMUnavailableError as e:
             raise HTTPException(
                 status_code=503,
@@ -220,6 +233,7 @@ async def preview_generate_exercises(
                 skeleton_code=result["skeleton_code"],
             )
         )
+        existing_titles.add(result["title"])
         stored.append(
             {
                 "language": body.language,

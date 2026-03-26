@@ -14,6 +14,8 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or ""
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 _GEMINI_MODEL_FALLBACKS_RAW = os.getenv("GEMINI_MODEL_FALLBACKS", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or ""
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 
 def _get_gemini_model_candidates() -> list[str]:
@@ -83,6 +85,246 @@ def _extract_text_from_gemini_response(data: dict) -> str:
             texts.append(part["text"])
 
     return "\n".join(texts).strip()
+
+
+def _extract_json_object_from_text(text: str) -> dict:
+    """
+    Best-effort JSON object extraction from model output.
+    Supports common cases like markdown fences and extra text around JSON.
+    """
+    if not text:
+        raise ValueError("empty model output")
+
+    # Remove markdown fences if present.
+    cleaned = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    cleaned = cleaned.replace("```", "").strip()
+
+    start = cleaned.find("{")
+    if start == -1:
+        raise ValueError("could not locate JSON object in model output")
+
+    # Prefer a real JSON parser over substring-to-last-brace, because braces may appear inside strings.
+    decoder = json.JSONDecoder()
+    tail = cleaned[start:]
+
+    # 1) raw_decode (best-effort, stops exactly at end of first JSON object)
+    try:
+        obj, _idx = decoder.raw_decode(tail)
+        if not isinstance(obj, dict):
+            raise ValueError("parsed JSON is not an object")
+        return obj
+    except json.JSONDecodeError:
+        pass
+
+    # 2) Remove common trailing comma mistakes: {...,} or [...,]
+    tail2 = re.sub(r",\s*([}\]])", r"\1", tail)
+    try:
+        obj, _idx = decoder.raw_decode(tail2)
+        if not isinstance(obj, dict):
+            raise ValueError("parsed JSON is not an object")
+        return obj
+    except json.JSONDecodeError:
+        pass
+
+    # 3) Sometimes models return JSON as a quoted string: "{...}"
+    stripped = tail.strip()
+    if (stripped.startswith('"') and stripped.endswith('"')) or (
+        stripped.startswith("'") and stripped.endswith("'")
+    ):
+        try:
+            inner = json.loads(stripped)
+            obj = json.loads(inner)
+            if not isinstance(obj, dict):
+                raise ValueError("parsed JSON is not an object")
+            return obj
+        except Exception:
+            pass
+
+    raise ValueError(f"invalid/truncated JSON output: {tail[:240]!r}")
+
+
+async def generate_exercise_with_groq(
+    language: str,
+    difficulty: str = "Beginner",
+    topic: str = "basics",
+    variant_nonce: str | None = None,
+    avoid_titles: list[str] | None = None,
+) -> "ExerciseGenerateResult":
+    """
+    Generate ONE coding exercise using Groq (OpenAI-compatible API).
+    Returns strict JSON fields compatible with ExerciseGenerateResult.
+    """
+    if not GROQ_API_KEY:
+        raise LLMUnavailableError("GROQ_API_KEY is not set")
+
+    schema = {
+        "title": "string",
+        "description": "string",
+        "skeleton_code": "string",
+        "difficulty": "string",
+        "expected_solution": "string",
+    }
+
+    # Keep the prompt close to the Gemini prompt, but add Groq JSON-mode constraints:
+    # Groq's strict json_object validation fails if strings contain literal newlines.
+    prompt = (
+        "You are a programming teacher. Generate ONE coding exercise in "
+        f"{language}. Difficulty: {difficulty}. Topic/focus: {topic}. "
+        "Return only valid JSON matching the requested schema.\n"
+        "Requested JSON schema keys: title, description, skeleton_code, difficulty, expected_solution.\n"
+        "Important JSON rules:\n"
+        "- Output MUST be a single JSON object.\n"
+        "- Every value must be a JSON string.\n"
+        "- Do NOT include literal newlines inside any string value; use the two-character sequence \\n instead.\n"
+        "- No trailing commas. No extra keys."
+    )
+    if variant_nonce:
+        prompt += f"\nUnique request id: {variant_nonce}."
+    if avoid_titles:
+        # Hint the model to vary the exercise.
+        prompt += "\nDo NOT use any of these titles: " + ", ".join([t for t in avoid_titles if t])
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.5,
+        "max_tokens": 900,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+    }
+
+    def _extract_chat_content(data: dict) -> str:
+        return (
+            (((data.get("choices") or [{}])[0] or {}).get("message") or {}).get("content")
+            or ""
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=120.0)) as client:
+            last_err: str | None = None
+
+            for attempt in range(1, 4):
+                this_payload = dict(payload)
+                # If we had to drop strict JSON mode, keep it dropped for retries.
+                if attempt > 1 and last_err and "json_validate_failed" in last_err:
+                    this_payload.pop("response_format", None)
+
+                resp = await client.post(url, json=this_payload, headers=headers)
+
+                if resp.status_code == 400 and "json_validate_failed" in (resp.text or ""):
+                    last_err = resp.text
+                    logger.warning("Groq json_object validation failed (attempt %s); retrying", attempt)
+                    continue
+
+                if resp.status_code >= 400:
+                    raise LLMUnavailableError(f"Groq returned {resp.status_code}: {resp.text[:800]}")
+
+                data = resp.json()
+                text = _extract_chat_content(data)
+                if not text.strip():
+                    raise LLMUnavailableError("Groq returned empty content")
+
+                try:
+                    parsed = _extract_json_object_from_text(text)
+                    return _finalize_exercise_result(parsed, language, difficulty)
+                except Exception as e:
+                    # Retry with a stronger brevity constraint to reduce truncation.
+                    last_err = f"{type(e).__name__}: {e}"
+                    logger.warning("Groq parse failed (attempt %s): %s", attempt, last_err)
+                    prompt += (
+                        "\nBrevity constraints:\n"
+                        "- description <= 160 characters\n"
+                        "- skeleton_code <= 20 lines\n"
+                        "- expected_solution <= 25 lines\n"
+                        "- Keep everything concise.\n"
+                    )
+                    this_payload["messages"] = [{"role": "user", "content": prompt}]
+                    this_payload["max_tokens"] = 1400
+                    payload = this_payload
+                    continue
+
+        raise LLMUnavailableError(f"Groq invalid JSON output after retries: {last_err}")
+    except httpx.HTTPError as e:
+        raise LLMUnavailableError(f"Groq request failed: {e}") from e
+
+
+async def evaluate_submission_with_groq(
+    language: str,
+    description: str,
+    expected_solution: str,
+    submitted_code: str,
+) -> "EvaluateResult":
+    """
+    Groq-based submission evaluator.
+
+    Requests ONLY {correct:boolean, feedback:string} to keep responses small.
+    """
+    if not GROQ_API_KEY:
+        raise LLMUnavailableError("GROQ_API_KEY is not set")
+
+    desc = (description or "").strip()[:2000]
+    ref = (expected_solution or "").strip()[:2500]
+    stu = (submitted_code or "").strip()[:5000]
+
+    # Keep prompt as close as possible to the Gemini evaluator prompt.
+    prompt = (
+        "You are a programming teacher and code reviewer.\n"
+        f"Language: {language}\n\n"
+        f"Problem description:\n{desc}\n\n"
+        f"Reference solution:\n{ref}\n\n"
+        f"Student submission:\n{stu}\n\n"
+        "Decide if the submission correctly solves the problem.\n"
+        "Return ONLY a valid JSON object that matches the schema.\n"
+        "Rules:\n"
+        "- correct=true only if the student submission matches the reference solution.\n"
+        "- feedback must be short (max 200 characters).\n"
+        "- No markdown. No extra text."
+    )
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0,
+        "max_tokens": 400,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, read=60.0)) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+        if resp.status_code >= 400:
+            raise LLMUnavailableError(
+                f"Groq returned {resp.status_code}: {resp.text[:400]}"
+            )
+        data = resp.json()
+        text = (
+            (((data.get("choices") or [{}])[0] or {}).get("message") or {}).get("content")
+            or ""
+        )
+        if not text.strip():
+            raise LLMUnavailableError("Groq returned empty content")
+
+        parsed = _extract_json_object_from_text(text)
+        correct = bool(parsed.get("correct", False))
+        feedback = str(parsed.get("feedback", "")).strip() or "No feedback."
+        return {
+            "correct": correct,
+            "feedback": feedback,
+            "correct_answer": "" if correct else expected_solution,
+        }
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        raise LLMUnavailableError(f"Groq invalid JSON output: {e}") from e
+    except httpx.HTTPError as e:
+        raise LLMUnavailableError(f"Groq request failed: {e}") from e
 
 
 async def generate_exercise_with_gemini(language: str, difficulty: str = "Beginner", topic: str = "basics"):
@@ -634,8 +876,14 @@ def _template_exercise_payload(language: str, difficulty: str, topic: str) -> di
 
 def _finalize_exercise_result(parsed: dict, language: str, difficulty: str) -> ExerciseGenerateResult:
     lang = language.lower()
-    raw_desc = str(parsed.get("description", "")).strip()
-    raw_skel = str(parsed.get("skeleton_code", "")).strip()
+    desc_val = parsed.get("description", "")
+    skel_val = parsed.get("skeleton_code", "")
+    exp_val = parsed.get("expected_solution", "")
+
+    # Groq sometimes returns null for fields; avoid turning it into the literal string "None".
+    raw_desc = desc_val.strip() if isinstance(desc_val, str) else ""
+    raw_skel = skel_val.strip() if isinstance(skel_val, str) else ""
+    raw_expected = exp_val.strip() if isinstance(exp_val, str) else ""
     generic_descs = ("complete the code as described", "complete the task described", "implement a simple function")
     if not raw_desc or any(g in raw_desc.lower() for g in generic_descs):
         if lang == "python":
@@ -648,12 +896,11 @@ def _finalize_exercise_result(parsed: dict, language: str, difficulty: str) -> E
         raw_skel = "# TODO: complete the code here" if lang == "python" else "// TODO: complete the code here"
 
     return {
-        "title": str(parsed.get("title", "Exercise")).strip() or "Exercise",
+        "title": (parsed.get("title") if isinstance(parsed.get("title"), str) else "Exercise").strip() or "Exercise",
         "description": raw_desc,
         "skeleton_code": raw_skel,
-        "difficulty": str(parsed.get("difficulty", difficulty)).strip() or difficulty,
-        "expected_solution": str(parsed.get("expected_solution", "")).strip()
-        or "# Solution",
+        "difficulty": (parsed.get("difficulty") if isinstance(parsed.get("difficulty"), str) else difficulty).strip() or difficulty,
+        "expected_solution": raw_expected or "# Solution",
     }
 
 
@@ -661,17 +908,23 @@ async def generate_exercise_with_llm(
     language: str,
     difficulty: str = "Beginner",
     topic: str = "basics",
+    variant_nonce: str | None = None,
+    avoid_titles: list[str] | None = None,
 ) -> ExerciseGenerateResult:
-    """Ask Ollama for one exercise; on HTTP 500, timeout, or bad JSON use templates (still returns 200)."""
-    # If Gemini is configured, it can provide more variety and speed than the local Ollama.
-    if GEMINI_API_KEY:
+    """Generate one exercise (Groq if configured, otherwise Ollama)."""
+    # Prefer Groq for exercises when configured.
+    if GROQ_API_KEY:
         try:
-            logger.info("Generating exercise with Gemini model=%s", GEMINI_MODEL)
-            return await generate_exercise_with_gemini(
-                language=language, difficulty=difficulty, topic=topic
+            logger.info("Generating exercise with Groq model=%s", GROQ_MODEL)
+            return await generate_exercise_with_groq(
+                language=language,
+                difficulty=difficulty,
+                topic=topic,
+                variant_nonce=variant_nonce,
+                avoid_titles=avoid_titles,
             )
         except Exception as e:
-            logger.warning("Gemini generation failed, falling back to Ollama: %s", e)
+            logger.warning("Groq generation failed, falling back to Ollama: %s", e)
 
     prompt = (
         f"You are a programming teacher. Generate ONE coding exercise in {language}.\n"
@@ -684,6 +937,10 @@ async def generate_exercise_with_llm(
         "expected_solution (string, only the correct code for the function/part; no explanations).\n\n"
         "JSON only. Keep everything concise."
     )
+    if variant_nonce:
+        prompt += f"\nUnique request id: {variant_nonce}."
+    if avoid_titles:
+        prompt += "\nDo NOT use any of these titles: " + ", ".join([t for t in avoid_titles if t])
     # CPU inference often needs >30s; Ollama may return 500 when overloaded — templates keep the app usable.
     timeout = httpx.Timeout(30.0, read=240.0)
     raw = ""
@@ -855,7 +1112,19 @@ async def evaluate_submission_with_llm(
     expected_solution: str,
     submitted_code: str,
 ) -> EvaluateResult:
-    """Ask Ollama whether the submitted code is correct. Returns correct, feedback, and correct_answer (if wrong)."""
+    """Evaluate submission (Groq if configured, otherwise Ollama)."""
+    if GROQ_API_KEY:
+        try:
+            logger.info("Evaluating exercise submission with Groq model=%s", GROQ_MODEL)
+            return await evaluate_submission_with_groq(
+                language=language,
+                description=description,
+                expected_solution=expected_solution,
+                submitted_code=submitted_code,
+            )
+        except Exception as e:
+            logger.warning("Groq evaluation failed, falling back to Ollama: %s", e)
+
     prompt = (
         f"You are a programming teacher. Exercise (in {language}):\n{description[:2000]}\n\n"
         f"Expected solution (reference):\n{expected_solution[:1500]}\n\n"

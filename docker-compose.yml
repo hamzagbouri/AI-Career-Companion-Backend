@@ -17,6 +17,9 @@ services:
       # Add it via your shell/env, not hardcoded in the repo.
       GEMINI_API_KEY: ${GEMINI_API_KEY}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3-flash-preview}
+      # Optional: when set, exercises (generation + evaluation) use Groq instead of Gemini/Ollama.
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GROQ_MODEL: ${GROQ_MODEL:-llama3-8b-8192}
     # DNS fix for intermittent "Name or service not known" / connect failures
     dns:
       - 8.8.8.8
