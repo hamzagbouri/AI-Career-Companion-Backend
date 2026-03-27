@@ -1,0 +1,74 @@
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ai_career_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - ai_career_net
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ai_career_grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    networks:
+      - ai_career_net
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:latest
+    container_name: ai_career_mlflow
+    ports:
+      - "5001:5000"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://postgres:password@mlflow_db:5432/mlflow
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --disable-security-middleware
+      --backend-store-uri ${MLFLOW_BACKEND_STORE_URI}
+      --default-artifact-root ${MLFLOW_DEFAULT_ARTIFACT_ROOT}
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    depends_on:
+      - mlflow_db
+    networks:
+      - ai_career_net
+
+  mlflow_db:
+    image: postgres:15
+    container_name: ai_career_mlflow_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: mlflow
+    ports:
+      - "5434:5432"
+    volumes:
+      - mlflow_db_data:/var/lib/postgresql/data
+    networks:
+      - ai_career_net
+
+volumes:
+  grafana_data:
+  mlflow_db_data:
+  mlflow_artifacts:
+
+networks:
+  ai_career_net:
+    external: true
+
