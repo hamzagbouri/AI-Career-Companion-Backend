@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "fastapi-backend"
+    metrics_path: /metrics
+    static_configs:
+      # Use container_name for cross-compose DNS reliability.
+      - targets: ["ai_career_backend:8000"]
+
