@@ -12,6 +12,17 @@ router = APIRouter(
     tags=["Auth"]
 )
 
+@router.get("/me")
+def me(user: User = Depends(get_current_user)):
+    return {
+        "id": user.id,
+        "full_name": user.full_name,
+        "email": user.email,
+        "role": user.role,
+        "status": user.status,
+        "created_at": user.created_at,
+    }
+
 
 @router.post("/register/student")
 def register_student(user: StudentRegister, db: Session = Depends(get_db)):

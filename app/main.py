@@ -10,7 +10,7 @@ from app.routers import auth, admin
 from app.utils.create_admin import create_default_admin
 from app.database import SessionLocal
 from app.seed_data import seed_certificates
-from app.routers import cv, exercises, certificates, recommendations
+from app.routers import cv, exercises, certificates, recommendations, mentor, admin_analytics
 from fastapi.staticfiles import StaticFiles
 
 
@@ -43,6 +43,8 @@ app.include_router(cv.router)
 app.include_router(exercises.router)
 app.include_router(certificates.router)
 app.include_router(recommendations.router)
+app.include_router(mentor.router)
+app.include_router(admin_analytics.router)
 
 
 @app.on_event("startup")
