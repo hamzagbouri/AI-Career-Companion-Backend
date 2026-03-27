@@ -9,6 +9,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+from app.services.mlflow_tracking import timed_run
+
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:8b")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or ""
@@ -449,42 +451,44 @@ async def audit_cv_with_llm(extracted_text: str) -> CVAuditResult:
     # Long read timeout: Ollama can take several minutes for llama3:8b
     timeout = httpx.Timeout(10.0, read=300.0)
 
-    try:
-        async with httpx.AsyncClient(base_url=OLLAMA_HOST, timeout=timeout) as client:
-            resp = await client.post(
-                "/api/generate",
-                json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                },
-            )
-            if resp.status_code >= 400:
-                try:
-                    err_body = resp.text
-                    if len(err_body) > 500:
-                        err_body = err_body[:500] + "..."
-                    logger.warning(
-                        "Ollama error status=%s body=%s",
-                        resp.status_code,
-                        err_body,
-                    )
-                except Exception:
-                    pass
-                raise LLMUnavailableError(
-                    f"LLM service returned {resp.status_code}. "
-                    "Ensure the model is pulled (e.g. ollama pull llama3:8b) and the container has enough memory."
+    with timed_run("cv_audit", tags={"component": "cv", "llm": "ollama"}) as run:
+        run["log_param"]("cv_chars", len(extracted_text or ""))
+        try:
+            async with httpx.AsyncClient(base_url=OLLAMA_HOST, timeout=timeout) as client:
+                resp = await client.post(
+                    "/api/generate",
+                    json={
+                        "model": OLLAMA_MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                    },
                 )
-            data = resp.json()
-            raw = data.get("response", "").strip()
-    except httpx.TimeoutException as e:
-        logger.warning("Ollama request timed out: %s", str(e))
-        raise LLMUnavailableError(
-            "LLM request timed out. Try again or use a shorter CV."
-        ) from e
-    except httpx.RequestError as e:
-        logger.warning("Ollama request failed: %s", type(e).__name__ + " " + str(e))
-        raise LLMUnavailableError("LLM service unreachable. Is Ollama running?") from e
+                if resp.status_code >= 400:
+                    try:
+                        err_body = resp.text
+                        if len(err_body) > 500:
+                            err_body = err_body[:500] + "..."
+                        logger.warning(
+                            "Ollama error status=%s body=%s",
+                            resp.status_code,
+                            err_body,
+                        )
+                    except Exception:
+                        pass
+                    raise LLMUnavailableError(
+                        f"LLM service returned {resp.status_code}. "
+                        "Ensure the model is pulled (e.g. ollama pull llama3:8b) and the container has enough memory."
+                    )
+                data = resp.json()
+                raw = data.get("response", "").strip()
+        except httpx.TimeoutException as e:
+            logger.warning("Ollama request timed out: %s", str(e))
+            raise LLMUnavailableError(
+                "LLM request timed out. Try again or use a shorter CV."
+            ) from e
+        except httpx.RequestError as e:
+            logger.warning("Ollama request failed: %s", type(e).__name__ + " " + str(e))
+            raise LLMUnavailableError("LLM service unreachable. Is Ollama running?") from e
 
     # Try to locate JSON in the response
     try:
@@ -503,13 +507,20 @@ async def audit_cv_with_llm(extracted_text: str) -> CVAuditResult:
             "score": 60,
         }
 
-    return {
+    out = {
         "summary": str(parsed.get("summary", "")),
         "strengths": [str(s) for s in parsed.get("strengths", [])],
         "weaknesses": [str(w) for w in parsed.get("weaknesses", [])],
         "recommendations": [str(r) for r in parsed.get("recommendations", [])],
         "score": int(parsed.get("score", 60)),
     }
+    try:
+        run["log_metric"]("score", float(out["score"]))
+        run["log_metric"]("strengths_count", float(len(out["strengths"])))
+        run["log_metric"]("weaknesses_count", float(len(out["weaknesses"])))
+    except Exception:
+        pass
+    return out
 
 
 class ExerciseGenerateResult(TypedDict):
@@ -913,18 +924,27 @@ async def generate_exercise_with_llm(
 ) -> ExerciseGenerateResult:
     """Generate one exercise (Groq if configured, otherwise Ollama)."""
     # Prefer Groq for exercises when configured.
-    if GROQ_API_KEY:
-        try:
-            logger.info("Generating exercise with Groq model=%s", GROQ_MODEL)
-            return await generate_exercise_with_groq(
-                language=language,
-                difficulty=difficulty,
-                topic=topic,
-                variant_nonce=variant_nonce,
-                avoid_titles=avoid_titles,
-            )
-        except Exception as e:
-            logger.warning("Groq generation failed, falling back to Ollama: %s", e)
+    with timed_run("exercise_generate", tags={"component": "exercises"}) as run:
+        run["log_param"]("language", language)
+        run["log_param"]("difficulty", difficulty)
+        run["log_param"]("topic", topic)
+
+        if GROQ_API_KEY:
+            try:
+                run["log_param"]("llm", "groq")
+                run["log_param"]("model", GROQ_MODEL)
+                logger.info("Generating exercise with Groq model=%s", GROQ_MODEL)
+                result = await generate_exercise_with_groq(
+                    language=language,
+                    difficulty=difficulty,
+                    topic=topic,
+                    variant_nonce=variant_nonce,
+                    avoid_titles=avoid_titles,
+                )
+                run["log_param"]("title", result.get("title", ""))
+                return result
+            except Exception as e:
+                logger.warning("Groq generation failed, falling back to Ollama: %s", e)
 
     prompt = (
         f"You are a programming teacher. Generate ONE coding exercise in {language}.\n"
@@ -945,6 +965,9 @@ async def generate_exercise_with_llm(
     timeout = httpx.Timeout(30.0, read=240.0)
     raw = ""
     try:
+        # If we reach here, we are using Ollama.
+        run["log_param"]("llm", "ollama")
+        run["log_param"]("model", OLLAMA_MODEL)
         async with httpx.AsyncClient(base_url=OLLAMA_HOST, timeout=timeout) as client:
             resp = await client.post(
                 "/api/generate",
@@ -967,6 +990,7 @@ async def generate_exercise_with_llm(
                     snippet,
                 )
                 payload = _template_exercise_payload(language, difficulty, topic)
+                run["log_param"]("fallback", "template")
                 return _finalize_exercise_result(payload, language, difficulty)
             data = resp.json()
             raw = data.get("response", "").strip()
@@ -976,10 +1000,12 @@ async def generate_exercise_with_llm(
             e,
         )
         payload = _template_exercise_payload(language, difficulty, topic)
+        run["log_param"]("fallback", "template")
         return _finalize_exercise_result(payload, language, difficulty)
     except httpx.RequestError as e:
         logger.warning("Ollama exercise generate request failed: %s — using template fallback", e)
         payload = _template_exercise_payload(language, difficulty, topic)
+        run["log_param"]("fallback", "template")
         return _finalize_exercise_result(payload, language, difficulty)
 
     try:
@@ -991,9 +1017,12 @@ async def generate_exercise_with_llm(
     except Exception:
         logger.info("Exercise JSON parse failed, using template fallback")
         payload = _template_exercise_payload(language, difficulty, topic)
+        run["log_param"]("fallback", "template")
         return _finalize_exercise_result(payload, language, difficulty)
 
-    return _finalize_exercise_result(parsed, language, difficulty)
+    result = _finalize_exercise_result(parsed, language, difficulty)
+    run["log_param"]("title", result.get("title", ""))
+    return result
 
 
 class EvaluateResult(TypedDict):
@@ -1113,17 +1142,23 @@ async def evaluate_submission_with_llm(
     submitted_code: str,
 ) -> EvaluateResult:
     """Evaluate submission (Groq if configured, otherwise Ollama)."""
-    if GROQ_API_KEY:
-        try:
-            logger.info("Evaluating exercise submission with Groq model=%s", GROQ_MODEL)
-            return await evaluate_submission_with_groq(
-                language=language,
-                description=description,
-                expected_solution=expected_solution,
-                submitted_code=submitted_code,
-            )
-        except Exception as e:
-            logger.warning("Groq evaluation failed, falling back to Ollama: %s", e)
+    with timed_run("exercise_evaluate", tags={"component": "exercises"}) as run:
+        run["log_param"]("language", language)
+        if GROQ_API_KEY:
+            try:
+                run["log_param"]("llm", "groq")
+                run["log_param"]("model", GROQ_MODEL)
+                logger.info("Evaluating exercise submission with Groq model=%s", GROQ_MODEL)
+                res = await evaluate_submission_with_groq(
+                    language=language,
+                    description=description,
+                    expected_solution=expected_solution,
+                    submitted_code=submitted_code,
+                )
+                run["log_metric"]("correct", 1.0 if res.get("correct") else 0.0)
+                return res
+            except Exception as e:
+                logger.warning("Groq evaluation failed, falling back to Ollama: %s", e)
 
     prompt = (
         f"You are a programming teacher. Exercise (in {language}):\n{description[:2000]}\n\n"
@@ -1160,9 +1195,16 @@ async def evaluate_submission_with_llm(
         parsed = json.loads(raw)
     except Exception:
         parsed = {"correct": False, "feedback": "Could not evaluate.", "correct_answer": expected_solution}
-    return {
+    out = {
         "correct": bool(parsed.get("correct", False)),
         "feedback": str(parsed.get("feedback", "")).strip() or "No feedback.",
         "correct_answer": str(parsed.get("correct_answer", "")).strip() or (expected_solution if not parsed.get("correct") else ""),
     }
+    try:
+        run["log_param"]("llm", "ollama")
+        run["log_param"]("model", OLLAMA_MODEL)
+        run["log_metric"]("correct", 1.0 if out.get("correct") else 0.0)
+    except Exception:
+        pass
+    return out
 

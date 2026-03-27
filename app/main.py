@@ -4,6 +4,7 @@ import os
 import httpx
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.database import engine, Base
 from app.routers import auth, admin
@@ -45,6 +46,9 @@ app.include_router(certificates.router)
 app.include_router(recommendations.router)
 app.include_router(mentor.router)
 app.include_router(admin_analytics.router)
+
+# Prometheus metrics at /metrics
+Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
 
 
 @app.on_event("startup")

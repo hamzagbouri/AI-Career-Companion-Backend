@@ -20,6 +20,8 @@ services:
       # Optional: when set, exercises (generation + evaluation) use Groq instead of Gemini/Ollama.
       GROQ_API_KEY: ${GROQ_API_KEY}
       GROQ_MODEL: ${GROQ_MODEL:-llama3-8b-8192}
+      # Optional: enable MLflow run logging when observability stack is up.
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI}
     # DNS fix for intermittent "Name or service not known" / connect failures
     dns:
       - 8.8.8.8
